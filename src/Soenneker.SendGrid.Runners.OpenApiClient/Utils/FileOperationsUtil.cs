@@ -19,6 +19,8 @@ using Soenneker.Kiota.Util.Abstract;
 using Soenneker.Utils.Directory.Abstract;
 using Soenneker.Utils.File.Abstract;
 using System.Collections.Generic;
+using System.Text.Json.Nodes;
+using Soenneker.Utils.Yaml.Abstract;
 
 namespace Soenneker.SendGrid.Runners.OpenApiClient.Utils;
 
@@ -35,9 +37,10 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
     private readonly IDirectoryUtil _directoryUtil;
     private readonly IOpenApiMerger _openApiMerger;
     private readonly IOpenApiFixer _openApiFixer;
+    private readonly IYamlUtil _yamlUtil;
 
     public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil, IProcessUtil processUtil,
-        IFileUtil fileUtil, IDirectoryUtil directoryUtil, IOpenApiMerger openApiMerger, IKiotaUtil kiotaUtil, IOpenApiFixer openApiFixer)
+        IFileUtil fileUtil, IDirectoryUtil directoryUtil, IOpenApiMerger openApiMerger, IKiotaUtil kiotaUtil, IOpenApiFixer openApiFixer, IYamlUtil yamlUtil)
     {
         _logger = logger;
         _configuration = configuration;
@@ -49,6 +52,7 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
         _directoryUtil = directoryUtil;
         _openApiMerger = openApiMerger;
         _openApiFixer = openApiFixer;
+        _yamlUtil = yamlUtil;
     }
 
     public async ValueTask Process(CancellationToken cancellationToken = default)
@@ -69,7 +73,29 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
         _logger.LogInformation("Merging SendGrid OpenAPI specs from {OpenApiRepositoryUrl} ({RepositorySubdirectory})...",
             openApiRepositoryUrl, repositorySubdirectory);
 
-        OpenApiDocument mergedOpenApiDocument = await _openApiMerger.MergeGitUrl(openApiRepositoryUrl, repositorySubdirectory, cancellationToken);
+        string sourceDirectory = await _gitUtil.CloneToTempDirectory(openApiRepositoryUrl, cancellationToken: cancellationToken);
+        string specsDirectory = Path.GetFullPath(Path.Combine(sourceDirectory, repositorySubdirectory ?? ""));
+        string relativeDirectory = Path.GetRelativePath(sourceDirectory, specsDirectory);
+        if (Path.IsPathRooted(relativeDirectory) || relativeDirectory == ".." ||
+            relativeDirectory.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidOperationException("The repository subdirectory must remain inside the cloned repository.");
+        for (DirectoryInfo? directory = new(specsDirectory); directory != null && directory.FullName != Path.TrimEndingDirectorySeparator(sourceDirectory); directory = directory.Parent)
+            if (directory.Exists && (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("The repository subdirectory must not traverse symbolic links or junctions.");
+
+        string[] sourceFiles = Directory.EnumerateFiles(specsDirectory, "*", new EnumerationOptions
+            { RecurseSubdirectories = true, IgnoreInaccessible = false, AttributesToSkip = FileAttributes.ReparsePoint })
+            .Where(file => Path.GetExtension(file).ToLowerInvariant() is ".json" or ".yaml" or ".yml").ToArray();
+        foreach (string sourceFile in sourceFiles.Where(file => !file.EndsWith(".json", StringComparison.OrdinalIgnoreCase)))
+            await _yamlUtil.SaveAsJson(sourceFile, sourceFile, true, cancellationToken);
+        foreach (string sourceFile in sourceFiles)
+        {
+            JsonNode? document = JsonNode.Parse(await _fileUtil.Read(sourceFile, log: false, cancellationToken));
+            if (document is JsonObject root && (root.ContainsKey("openapi") || root.ContainsKey("swagger")))
+                await _openApiFixer.Fix(sourceFile, sourceFile, cancellationToken).NoSync();
+        }
+
+        OpenApiDocument mergedOpenApiDocument = await _openApiMerger.MergeDirectory(specsDirectory, cancellationToken);
         string mergedOpenApiJson = _openApiMerger.ToJson(mergedOpenApiDocument);
 
         await _fileUtil.Write(openApiFilePath, mergedOpenApiJson, true, cancellationToken);
